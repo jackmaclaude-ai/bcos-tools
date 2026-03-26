@@ -1,0 +1,176 @@
+name: 'BCOS v2 Scan'
+description: 'Run a BCOS v2 (Beacon Certified Open Source) scan on your repository and anchor the result to RustChain.'
+author: 'Scottcjn'
+
+branding:
+  icon: 'shield'
+  color: 'green'
+
+inputs:
+  tier:
+    description: 'BCOS certification tier to target: L0, L1, or L2'
+    required: false
+    default: 'L1'
+  reviewer:
+    description: 'GitHub username of a human reviewer (required for L2 tier)'
+    required: false
+    default: ''
+  node-url:
+    description: 'RustChain node URL for on-chain attestation anchoring'
+    required: false
+    default: 'https://50.28.86.131'
+  fail-on-tier-miss:
+    description: 'Fail the workflow if the requested tier is not met'
+    required: false
+    default: 'false'
+  post-pr-comment:
+    description: 'Post a badge + score breakdown comment on the PR'
+    required: false
+    default: 'true'
+
+outputs:
+  trust_score:
+    description: 'Numeric trust score (0–100)'
+  cert_id:
+    description: 'BCOS Certificate ID (e.g. BCOS-abc123), empty if not yet anchored'
+  tier_met:
+    description: '"true" if the requested tier was achieved, "false" otherwise'
+  report_path:
+    description: 'Path to the full JSON report artifact'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Install BCOS engine dependencies
+      shell: bash
+      run: |
+        pip install --quiet clawrtc pip-audit semgrep 2>/dev/null || \
+        pip install --quiet clawrtc pip-audit 2>/dev/null || \
+        pip install --quiet clawrtc 2>/dev/null || true
+        # Download bcos_engine.py directly from RustChain repo
+        curl -sSL "https://raw.githubusercontent.com/Scottcjn/Rustchain/main/tools/bcos_engine.py" \
+          -o "${{ github.action_path }}/bcos_engine.py" || true
+
+    - name: Run BCOS scan
+      id: bcos_scan
+      shell: bash
+      env:
+        BCOS_TIER: ${{ inputs.tier }}
+        BCOS_REVIEWER: ${{ inputs.reviewer }}
+        BCOS_NODE_URL: ${{ inputs.node-url }}
+        BCOS_REPO_PATH: ${{ github.workspace }}
+        BCOS_REPO_NAME: ${{ github.repository }}
+        BCOS_COMMIT_SHA: ${{ github.sha }}
+        BCOS_ACTION_PATH: ${{ github.action_path }}
+      run: python "${{ github.action_path }}/action/run_scan.py"
+
+    - name: Set outputs
+      shell: bash
+      run: |
+        echo "trust_score=$(cat /tmp/bcos_trust_score.txt 2>/dev/null || echo 0)" >> "$GITHUB_OUTPUT"
+        echo "cert_id=$(cat /tmp/bcos_cert_id.txt 2>/dev/null || echo '')" >> "$GITHUB_OUTPUT"
+        echo "tier_met=$(cat /tmp/bcos_tier_met.txt 2>/dev/null || echo false)" >> "$GITHUB_OUTPUT"
+        echo "report_path=$(cat /tmp/bcos_report_path.txt 2>/dev/null || echo '')" >> "$GITHUB_OUTPUT"
+
+    - name: Upload BCOS report artifact
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: bcos-report
+        path: /tmp/bcos_report_*.json
+        if-no-files-found: ignore
+
+    - name: Post PR comment
+      if: inputs.post-pr-comment == 'true' && github.event_name == 'pull_request'
+      uses: actions/github-script@v7
+      env:
+        BCOS_NODE_URL: ${{ inputs.node-url }}
+      with:
+        script: |
+          const fs = require('fs');
+          const score = parseInt(process.env['trust_score'] || '0');
+          const certId = process.env['cert_id'] || '';
+          const tierMet = process.env['tier_met'] === 'true';
+          const tier = '${{ inputs.tier }}';
+          const nodeUrl = process.env['BCOS_NODE_URL'];
+          const badgeUrl = certId
+            ? `${nodeUrl}/bcos/badge/${certId}.svg`
+            : `${nodeUrl}/bcos/badge/pending.svg`;
+          const verifyUrl = certId
+            ? `https://rustchain.org/bcos/verify/${certId}`
+            : 'https://rustchain.org/bcos/';
+          const tierEmoji = tierMet ? '✅' : '⚠️';
+          const scoreBar = '█'.repeat(Math.floor(score / 10)) + '░'.repeat(10 - Math.floor(score / 10));
+
+          // Try to read detailed breakdown from report
+          let breakdown = '';
+          try {
+            const reportFiles = fs.readdirSync('/tmp').filter(f => f.startsWith('bcos_report_'));
+            if (reportFiles.length > 0) {
+              const report = JSON.parse(fs.readFileSync(`/tmp/${reportFiles[0]}`, 'utf8'));
+              if (report.breakdown) {
+                breakdown = '\n\n**Score Breakdown:**\n' + Object.entries(report.breakdown)
+                  .map(([k,v]) => `- \`${k}\`: ${v}`)
+                  .join('\n');
+              }
+            }
+          } catch(e) {}
+
+          const body = [
+            `## ⬡ BCOS v2 Scan Result`,
+            ``,
+            `[![BCOS](${badgeUrl})](${verifyUrl})`,
+            ``,
+            `| Metric | Value |`,
+            `|--------|-------|`,
+            `| Trust Score | \`${score}/100\` \`${scoreBar}\` |`,
+            `| Tier Requested | \`${tier}\` |`,
+            `| Tier Met | ${tierEmoji} \`${tierMet}\` |`,
+            `| Certificate | ${certId ? `[\`${certId}\`](${verifyUrl})` : '_Pending anchor_'} |`,
+            `| Commit | \`${context.sha.slice(0,7)}\` |`,
+            breakdown,
+            ``,
+            `<details><summary>What is BCOS?</summary>`,
+            ``,
+            `[BCOS v2](https://rustchain.org/bcos/) (Beacon Certified Open Source) is an open-source trust scoring system for software repositories. Scores are anchored to the RustChain blockchain for permanent, tamper-evident proof.`,
+            ``,
+            `</details>`,
+          ].join('\n');
+
+          // Upsert comment (update existing BCOS comment if present)
+          const comments = await github.rest.issues.listComments({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            issue_number: context.issue.number,
+          });
+          const existing = comments.data.find(c => c.body.includes('⬡ BCOS v2 Scan Result'));
+          if (existing) {
+            await github.rest.issues.updateComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: existing.id,
+              body,
+            });
+          } else {
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body,
+            });
+          }
+
+    - name: Fail if tier not met
+      if: inputs.fail-on-tier-miss == 'true'
+      shell: bash
+      run: |
+        tier_met=$(cat /tmp/bcos_tier_met.txt 2>/dev/null || echo false)
+        if [ "$tier_met" != "true" ]; then
+          echo "::error::BCOS tier ${{ inputs.tier }} not met. See report for details."
+          exit 1
+        fi
