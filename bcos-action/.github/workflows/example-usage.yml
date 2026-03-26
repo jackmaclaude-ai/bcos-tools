@@ -1,0 +1,34 @@
+name: Example - Run BCOS v2 on PRs
+on:
+  pull_request:
+    branches: [main, master]
+  push:
+    branches: [main, master]
+
+jobs:
+  bcos-scan:
+    name: BCOS v2 Certification Scan
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run BCOS v2 Scan
+        id: bcos
+        uses: Scottcjn/bcos-action@v1
+        with:
+          tier: L1                   # L0, L1, or L2
+          reviewer: ''               # GitHub username for L2 human review
+          node-url: 'https://50.28.86.131'
+          fail-on-tier-miss: 'false' # set 'true' to block merges below tier
+          post-pr-comment: 'true'    # posts badge + breakdown on PR
+
+      - name: Print BCOS outputs
+        run: |
+          echo "Trust Score : ${{ steps.bcos.outputs.trust_score }}"
+          echo "Cert ID     : ${{ steps.bcos.outputs.cert_id }}"
+          echo "Tier Met    : ${{ steps.bcos.outputs.tier_met }}"
